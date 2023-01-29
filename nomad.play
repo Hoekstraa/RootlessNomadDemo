@@ -1,0 +1,204 @@
+---
+# How to run: sudo ansible-playbook nomad.play
+# encryption key is also pass to the vault
+#
+# Thanks to TecHunter, for making this file (rootless podman in nomad): https://github.com/TecHunter/nomad-consul-vault/blob/master/roles/nomad/tasks/main.yml
+
+
+
+# https://developer.hashicorp.com/consul/tutorials/production-deploy/deployment-guide
+- name: Consul is installed
+  hosts: localhost
+  remote_user: root
+  vars_prompt:
+    - name: consul_encrypt_key
+      prompt: Enter the Consul Encryption key
+  
+  tasks:
+  - name: Hashicorp repo is available
+    ansible.builtin.get_url:
+      url: https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo
+      dest: /etc/yum.repos.d/hashicorp.repo
+      mode: '0444'
+
+  - name: Consul package is installed
+    ansible.builtin.dnf:
+      name:
+        - consul
+      state: latest
+  
+  - name: Consul config directory exists and is owned by consul user
+    ansible.builtin.file:
+      path: /etc/consul.d
+      state: directory
+      mode: '0755'
+      owner: consul
+      group: consul
+
+  - name: Consul configuration is in it's location
+    ansible.builtin.template:
+      src: ./files/consul.hcl.j2
+      dest: /etc/consul.d/consul.hcl
+      mode: '0600'
+      owner: consul
+      group: consul
+  
+  - name: Consul server configuration is in it's location
+    ansible.builtin.copy:
+      src: ./files/server.hcl
+      dest: /etc/consul.d/server.hcl
+      mode: '0644'
+      owner: consul
+      group: consul
+
+  - name: Consul service is in place
+    ansible.builtin.copy:
+      src: ./files/consul.service
+      dest: /etc/systemd/system/consul.service
+      mode: '0644'
+      owner: root
+      group: root
+
+  - name: Consul service is started and will start on boot
+    ansible.builtin.systemd:
+      name: consul
+      state: started
+      enabled: yes
+      daemon-reload: no
+
+  - name: Certs are in place
+    ansible.builtin.copy:
+      src: ./files/certs
+      dest: /etc/consul.d/
+      mode: '0600'
+      owner: consul
+      group: consul
+
+# https://developer.hashicorp.com/nomad/tutorials/enterprise/production-deployment-guide-vm-with-consul
+- name: Install Nomad
+  hosts: localhost
+  remote_user: root
+
+  tasks:
+  - name: Hashicorp repo is available
+    ansible.builtin.get_url:
+      url: https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo
+      dest: /etc/yum.repos.d/hashicorp.repo
+      mode: '0444'
+
+  - name: Nomad package is installed
+    ansible.builtin.dnf:
+      name:
+        - nomad
+      state: latest
+
+  - name: Nomad service is in place
+    ansible.builtin.copy:
+      src: ./files/nomad/nomad.service
+      dest: /etc/systemd/system/nomad.service
+      mode: '0644'
+      owner: root
+      group: root
+
+  - name: Nomad configuration is in it's location
+    ansible.builtin.template:
+      src: ./files/nomad/nomad.hcl
+      dest: /etc/nomad.d/nomad.hcl
+      mode: '0600'
+      owner: nomad
+      group: nomad
+  
+  - name: Nomad service is started and will start on boot
+    ansible.builtin.systemd:
+      name: nomad 
+      state: started
+      enabled: yes
+      daemon-reload: no
+
+- name: Install rootless containers
+  hosts: localhost
+  remote_user: root
+  
+  tasks:
+  - name: Podman package is installed
+    dnf:
+      name:
+      - podman
+      state: latest
+
+  - name: Nomad user lingering is enabled
+    shell: "loginctl enable-linger nomad"
+
+  - name: Nomad user has home folder
+    file:
+      path: "/home/nomad/"
+      state: directory
+      mode: '0755'
+      owner: nomad
+      owner: nomad
+
+  - name: Plugins folder exists
+    file:
+      path: /opt/nomad/data/plugins
+      state: directory
+      mode: '0755'
+      owner: nomad
+      owner: nomad
+
+  - name: Nomad user owns config folder
+    file:
+      path: "/home/nomad/.config"
+      state: directory
+      mode: '0755'
+      owner: nomad
+      owner: nomad
+      recurse: yes
+
+# https://releases.hashicorp.com/nomad-driver-podman/
+  - name: Podman driver is installed
+    file:
+      src: ./files/podman/nomad-driver-podman
+      dest: /opt/nomad/data/plugins/nomad-driver-podman
+      state: hard
+      owner: nomad
+      group: nomad
+  
+  - name: Add sub ids for nomad user
+    lineinfile:
+      dest: "/etc/{{ item }}"
+      regexp: "^nomad:(\\d+):(\\d+)$"
+      line: "nomad:100000:65536"
+      create: true
+      state: present
+    with_items:
+    - subuid
+    - subgid
+
+  - name: Get Nomad user id
+    user:
+      name: nomad
+    register: user
+
+  - name: debug
+    debug:
+      msg: "User: {{user}}"
+
+  - name: debug
+    debug:
+      msg: "User id: {{user['uid']}}"
+
+  - name: Register systemd socket activation
+    become: yes
+    become_user: "nomad"
+    systemd:
+      name: "{{ item }}"
+      enabled: true
+      state: started
+      daemon_reload: true
+      scope: user
+    with_items:
+      - podman.socket
+      - podman.service
+    environment:
+      XDG_RUNTIME_DIR: "/run/user/{{user.uid}}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{user.uid}}/bus"
